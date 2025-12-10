@@ -1,7 +1,10 @@
 pandas~=2.3.3
-numpy~=2.3.4
+numpy~=2.2.1
 wfdb~=4.3.0
 scikit-learn~=1.7.2
 tensorflow~=2.20.0
 jupyter~=1.1.1
+matplotlib~=3.9.2
+scipy~=1.14.1
+tqdm~=4.66.4
 seaborn~=0.13.0
