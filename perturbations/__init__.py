@@ -6,12 +6,16 @@ from .evaluation import (
     compute_global_metrics,
     compute_targeted_success,
     compute_untargeted_asr,
+    load_all_vulnerability_results,
+    load_noise_vulnerability_results,
     predict_proba_batch,
     predict_proba_single,
     results_to_dataframe,
     run_attack_on_sample,
+    run_noise_vulnerability_experiment,
     summarize_norms,
     summarize_smoothness,
+    save_noise_vulnerability_results,
 )
 from .morphology import detect_r_peaks, local_amplitude_scaling, local_time_warp
 from .noise import band_limited_noise, baseline_wander
@@ -48,6 +52,10 @@ __all__ = [
     "compute_untargeted_asr",
     "compute_targeted_success",
     "compute_global_metrics",
+    "run_noise_vulnerability_experiment",
+    "save_noise_vulnerability_results",
+    "load_noise_vulnerability_results",
+    "load_all_vulnerability_results",
     "plot_triptych",
     "plot_overlay_with_diff",
     "plot_asr_vs_strength",

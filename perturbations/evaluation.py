@@ -7,9 +7,17 @@ that different perturbation families can share a single analysis pipeline.
 
 from __future__ import annotations
 
+import json
+import logging
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is an optional dependency
+    tqdm = None
 
 import numpy as np
 import pandas as pd
@@ -22,6 +30,10 @@ from .config import CLASS_TO_INDEX, CLASS_NAMES
 from .tf_utils import tf_device_scope
 
 DEFAULT_STRENGTH_SCHEDULE: Tuple[float, ...] = (0.10, 0.20, 0.35, 0.50)
+DEFAULT_NOISE_TYPES: Tuple[str, ...] = ("baseline_wander", "band_noise")
+DEFAULT_NOISE_TRIALS: int = 3
+SMOOTH_ATTACK_FAMILY = "smooth_adv"
+NOISE_ATTACK_FAMILY = "noise"
 
 
 @dataclass
@@ -514,6 +526,7 @@ def run_saliency_guided_attacks(
                     window_seconds=window_seconds,
                     target_class=None,
                     extra={
+                        "attack_family": SMOOTH_ATTACK_FAMILY,
                         "record_id": record_id,
                         "window_id": window_id,
                         "saliency_rank": window["rank"],
@@ -542,6 +555,8 @@ def run_saliency_guided_attacks(
                 {
                     "record_id": record_id,
                     "window_id": window_id,
+                    "attack_family": SMOOTH_ATTACK_FAMILY,
+                    "noise_type": None,
                     "center_time": window["center_time"],
                     "center_index": window["center_index"],
                     "window_seconds": window_seconds,
@@ -562,6 +577,179 @@ def run_saliency_guided_attacks(
                     if best_result is not None
                     else None,
                 }
+            )
+
+    df_windows = pd.DataFrame(window_rows)
+    return attack_results, df_windows
+
+
+def run_noise_vulnerability_experiment(
+    X: np.ndarray,
+    Y: np.ndarray,
+    model,
+    eval_indices: Sequence[int],
+    *,
+    fs: float = 100.0,
+    noise_types: Optional[Sequence[str]] = None,
+    strength_schedule: Optional[Sequence[float]] = None,
+    n_trials: int = DEFAULT_NOISE_TRIALS,
+    window_seconds: float = 2.0,
+    top_k: int = 3,
+    center_stride: int = 5,
+    max_overlap: float = 0.25,
+    seed_base: int = 0,
+    saliency_cache: Optional[Dict[int, np.ndarray]] = None,
+    progress: bool = True,
+    report_every: int = 50,
+) -> Tuple[List[AttackResult], pd.DataFrame]:
+    """
+    Run stochastic noise perturbations on saliency-selected windows.
+    """
+
+    if n_trials <= 0:
+        raise ValueError("n_trials must be positive.")
+    schedule = tuple(strength_schedule) if strength_schedule else DEFAULT_STRENGTH_SCHEDULE
+    families = tuple(noise_types) if noise_types else DEFAULT_NOISE_TYPES
+    if not families:
+        raise ValueError("noise_types must contain at least one entry.")
+
+    attack_results: List[AttackResult] = []
+    window_rows: List[Dict[str, Any]] = []
+    cache = saliency_cache or {}
+    record_ids = [int(idx) for idx in eval_indices]
+    iterator: Iterable[int]
+    if progress and tqdm is not None:
+        iterator = tqdm(record_ids, desc="Noise vulnerability", unit="sample")
+    else:
+        iterator = record_ids
+
+    start_time = time.time()
+    total = len(record_ids)
+
+    for processed, record_id in enumerate(iterator, start=1):
+        x_clean = np.asarray(X[record_id], dtype=np.float32)
+        y_true = np.asarray(Y[record_id], dtype=int)
+        saliency = cache.get(record_id)
+        if saliency is None:
+            saliency = compute_time_saliency(x_clean, y_true, model, fs=fs)
+            cache[record_id] = saliency
+        windows = select_salient_windows(
+            saliency,
+            fs=fs,
+            window_seconds=window_seconds,
+            K=top_k,
+            center_stride=center_stride,
+            max_overlap=max_overlap,
+        )
+        y_true_bits = y_true.astype(int).tolist()
+
+        for window in windows:
+            window_id = f"{record_id}_w{window['rank']}"
+            center_time = float(window["center_time"])
+            center_index = int(window["center_index"])
+            saliency_rank = int(window["rank"])
+            saliency_mean = float(window["saliency_mean"])
+
+            for noise_offset, noise_type in enumerate(families):
+                minimal_strength: Optional[float] = None
+                best_result: Optional[AttackResult] = None
+                first_clean: Optional[List[int]] = None
+                success_rates: Dict[float, float] = {}
+
+                for strength_idx, strength in enumerate(schedule):
+                    successes = 0
+                    for trial_idx in range(n_trials):
+                        cfg = PerturbationConfig(
+                            ptype=noise_type,
+                            strength=float(strength),
+                            center_time=center_time,
+                            window_seconds=window_seconds,
+                            target_class=None,
+                            extra={
+                                "attack_family": NOISE_ATTACK_FAMILY,
+                                "noise_type": noise_type,
+                                "record_id": record_id,
+                                "window_id": window_id,
+                                "saliency_rank": saliency_rank,
+                                "saliency_mean": saliency_mean,
+                                "trial_index": trial_idx,
+                                "n_noise_trials": n_trials,
+                                "strength_schedule": list(schedule),
+                            },
+                        )
+                        seed = (
+                            seed_base
+                            + record_id * 10_000
+                            + saliency_rank * 1_000
+                            + noise_offset * 100
+                            + strength_idx * 10
+                            + trial_idx
+                        )
+                        result, _ = run_attack_on_sample(
+                            model,
+                            x_clean,
+                            y_true,
+                            cfg,
+                            fs=fs,
+                            rng=np.random.default_rng(seed),
+                        )
+                        attack_results.append(result)
+                        if first_clean is None:
+                            first_clean = result.y_hat_clean.astype(int).tolist()
+                        if result.untargeted_success:
+                            successes += 1
+                            if minimal_strength is None:
+                                minimal_strength = float(strength)
+                                best_result = result
+                    success_rates[float(strength)] = successes / float(n_trials)
+
+                success_rates_json = json.dumps(
+                    [
+                        {"strength": float(strength), "success_rate": float(success_rates[strength])}
+                        for strength in schedule
+                    ]
+                )
+                window_rows.append(
+                    {
+                        "record_id": record_id,
+                        "window_id": window_id,
+                        "attack_family": NOISE_ATTACK_FAMILY,
+                        "noise_type": noise_type,
+                        "center_time": center_time,
+                        "center_index": center_index,
+                        "window_seconds": window_seconds,
+                        "saliency_rank": saliency_rank,
+                        "saliency_mean": saliency_mean,
+                        "y_true_bits": y_true_bits,
+                        "minimal_strength": minimal_strength,
+                        "strength_star_window": minimal_strength,
+                        "success_rate_by_strength": success_rates_json,
+                        "binary_iters": 0,
+                        "binary_converged": False,
+                        "delta_norm_l2": best_result.delta_norm_l2 if best_result else np.nan,
+                        "delta_norm_linf": best_result.delta_norm_linf if best_result else np.nan,
+                        "delta_smoothness": best_result.delta_smoothness if best_result else np.nan,
+                        "y_hat_clean": best_result.y_hat_clean.astype(int).tolist()
+                        if best_result is not None
+                        else first_clean,
+                        "y_hat_adv": best_result.y_hat_adv.astype(int).tolist()
+                        if best_result is not None
+                        else None,
+                    }
+                )
+
+        if progress and report_every > 0 and processed % report_every == 0 and total:
+            elapsed = max(time.time() - start_time, 1e-9)
+            rate = processed / elapsed
+            remaining = total - processed
+            eta = remaining / rate if rate > 0 else float("nan")
+            logging.info(
+                "[noise] Processed %d/%d samples (%.1f%%) - %.2f samples/s - ETA %.1f min",
+                processed,
+                total,
+                100.0 * processed / total,
+                rate,
+                eta / 60.0 if np.isfinite(eta) else float("nan"),
             )
 
     df_windows = pd.DataFrame(window_rows)
@@ -700,18 +888,23 @@ def summarize_minimal_strength_per_sample(df_windows: pd.DataFrame) -> pd.DataFr
             best_row = group.loc[idx_best]
             strength = float(best_row[metric_col])
         base_row = group.iloc[0]
-        rows.append(
-            {
-                "record_id": int(record_id),
-                "strength_star_sample": strength,
-                "best_window_id": best_row["window_id"] if best_row is not None else None,
-                "best_window_center_time": float(best_row["center_time"]) if best_row is not None else np.nan,
-                "best_window_saliency_rank": int(best_row["saliency_rank"]) if best_row is not None else np.nan,
-                "best_window_saliency_mean": float(best_row["saliency_mean"]) if best_row is not None else np.nan,
-                "y_true_bits": base_row["y_true_bits"],
-                "y_hat_clean": best_row["y_hat_clean"] if best_row is not None else base_row["y_hat_clean"],
-            }
-        )
+        row = {
+            "record_id": int(record_id),
+            "strength_star_sample": strength,
+            "best_window_id": best_row["window_id"] if best_row is not None else None,
+            "best_window_center_time": float(best_row["center_time"]) if best_row is not None else np.nan,
+            "best_window_saliency_rank": int(best_row["saliency_rank"]) if best_row is not None else np.nan,
+            "best_window_saliency_mean": float(best_row["saliency_mean"]) if best_row is not None else np.nan,
+            "y_true_bits": base_row["y_true_bits"],
+            "y_hat_clean": best_row["y_hat_clean"] if best_row is not None else base_row["y_hat_clean"],
+        }
+        if "attack_family" in group.columns:
+            row["attack_family"] = (
+                best_row["attack_family"] if best_row is not None else base_row.get("attack_family")
+            )
+        if "noise_type" in group.columns:
+            row["best_noise_type"] = best_row["noise_type"] if best_row is not None else base_row.get("noise_type")
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -763,3 +956,69 @@ def load_vulnerability_results(
         _read("saliency_guided_windows"),
         _read("minimal_strength_samples"),
     )
+
+
+def save_noise_vulnerability_results(
+    df_attempts: pd.DataFrame,
+    df_windows: pd.DataFrame,
+    df_samples: pd.DataFrame,
+    *,
+    root: str = "results/vulnerability",
+) -> None:
+    """
+    Persist noise vulnerability experiment outputs.
+    """
+
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True)
+
+    def _write(df: pd.DataFrame, stem: str) -> None:
+        parquet_path = root_path / f"{stem}.parquet"
+        csv_path = root_path / f"{stem}.csv"
+        df.to_parquet(parquet_path, index=False)
+        df.to_csv(csv_path, index=False)
+
+    _write(df_attempts, "noise_attempts")
+    _write(df_windows, "noise_windows")
+    _write(df_samples, "noise_samples")
+
+
+def load_noise_vulnerability_results(
+    root: str = "results/vulnerability",
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Load saved noise vulnerability experiment outputs.
+    """
+
+    root_path = Path(root)
+
+    def _read(stem: str) -> pd.DataFrame:
+        parquet_path = root_path / f"{stem}.parquet"
+        csv_path = root_path / f"{stem}.csv"
+        if parquet_path.exists():
+            return pd.read_parquet(parquet_path)
+        if csv_path.exists():
+            return pd.read_csv(csv_path)
+        return pd.DataFrame()
+
+    return _read("noise_attempts"), _read("noise_windows"), _read("noise_samples")
+
+
+def load_all_vulnerability_results(
+    root: str = "results/vulnerability",
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Load both smooth_adv and noise vulnerability tables and concatenate them.
+    """
+
+    smooth = load_vulnerability_results(root)
+    noise = load_noise_vulnerability_results(root)
+
+    def _concat(idx: int) -> pd.DataFrame:
+        frames = [smooth[idx], noise[idx]]
+        frames = [df for df in frames if not df.empty]
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True, sort=False)
+
+    return _concat(0), _concat(1), _concat(2)
