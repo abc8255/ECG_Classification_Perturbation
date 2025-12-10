@@ -484,6 +484,7 @@ def run_saliency_guided_attacks(
     max_overlap: float = 0.25,
     seed_base: int = 0,
     saliency_cache: Optional[Dict[int, np.ndarray]] = None,
+    progress: bool = True,
 ) -> Tuple[List[AttackResult], pd.DataFrame]:
     """
     Compute saliency, select windows, run smooth_adv attacks, and log attempts.
@@ -493,8 +494,10 @@ def run_saliency_guided_attacks(
     attack_results: List[AttackResult] = []
     window_rows: List[Dict[str, Any]] = []
     cache = saliency_cache or {}
+    record_ids = [int(idx) for idx in eval_indices]
+    total = len(record_ids)
 
-    for record_id in map(int, eval_indices):
+    for processed, record_id in enumerate(record_ids, start=1):
         x_clean = np.asarray(X[record_id], dtype=np.float32)
         y_true = np.asarray(Y[record_id], dtype=int)
         saliency = cache.get(record_id)
@@ -577,6 +580,14 @@ def run_saliency_guided_attacks(
                     if best_result is not None
                     else None,
                 }
+            )
+
+        if progress:
+            logging.info(
+                "[smooth] Processed %d/%d samples (record_id=%s)",
+                processed,
+                total,
+                record_id,
             )
 
     df_windows = pd.DataFrame(window_rows)
@@ -738,6 +749,13 @@ def run_noise_vulnerability_experiment(
                     }
                 )
 
+        if progress:
+            logging.info(
+                "[noise] Processed %d/%d samples (record_id=%s)",
+                processed,
+                total,
+                record_id,
+            )
         if progress and report_every > 0 and processed % report_every == 0 and total:
             elapsed = max(time.time() - start_time, 1e-9)
             rate = processed / elapsed
